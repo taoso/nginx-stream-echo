@@ -10,12 +10,12 @@
 
 
 typedef struct {
-    ngx_chain_t                 *out;
+    ngx_chain_t                 *buf_chain;
 } ngx_stream_echo_ctx_t;
 
 
-static ngx_int_t ngx_stream_echo_init(ngx_conf_t *cf);
 static void ngx_stream_echo_handler(ngx_stream_session_t *s);
+static void ngx_stream_echo_read_handler(ngx_event_t *ev);
 static void ngx_stream_echo_write_handler(ngx_event_t *ev);
 
 static char *ngx_stream_echo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -36,7 +36,7 @@ static ngx_command_t  ngx_stream_echo_commands[] = {
 
 static ngx_stream_module_t  ngx_stream_echo_module_ctx = {
     NULL,                                  /* preconfiguration */
-    ngx_stream_echo_init,                  /* postconfiguration */
+    NULL,                                  /* postconfiguration */
 
     NULL,                                  /* create main configuration */
     NULL,                                  /* init main configuration */
@@ -70,28 +70,115 @@ ngx_stream_echo_handler(ngx_stream_session_t *s)
 
     c = s->connection;
 
-    c->log->action = "echo text";
+    c->log->action = "echo";
 
-    ctx = ngx_pcalloc(c->pool, sizeof(ngx_stream_echo_ctx_t));
+    ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
+
     if (ctx == NULL) {
-        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-        return;
+
+        ctx = ngx_pcalloc(c->pool, sizeof(ngx_stream_echo_ctx_t));
+
+        if (ctx == NULL) {
+            ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        ngx_stream_set_ctx(s, ctx, ngx_stream_echo_module);
     }
 
-    ngx_stream_set_ctx(s, ctx, ngx_stream_echo_module);
-
-    ctx->out = ngx_alloc_chain_link(c->pool);
-    if (ctx->out == NULL) {
-        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-        return;
-    }
-
-    ctx->out->buf = c->buffer;
-    ctx->out->next = NULL;
-
+    c->read->handler = ngx_stream_echo_read_handler;
     c->write->handler = ngx_stream_echo_write_handler;
 
+    ngx_stream_echo_read_handler(c->read);
+
+    ngx_add_timer(c->read, 5000);
+}
+
+static void
+ngx_stream_echo_read_handler(ngx_event_t *ev)
+{
+    ngx_chain_t           *buf_chain;
+    ngx_chain_t                 **lb;
+    ngx_buf_t                   *buf;
+    ngx_int_t                     rc;
+    ngx_connection_t              *c;
+    ngx_stream_session_t          *s;
+    ngx_stream_echo_ctx_t       *ctx;
+    ssize_t                     size;
+    ssize_t                        n;
+
+    rc = NGX_AGAIN;
+
+    c = ev->data;
+    s = c->data;
+
+    if (ev->timedout) {
+        ngx_connection_error(c, NGX_ETIMEDOUT, "connection timed out");
+        ngx_stream_finalize_session(s, NGX_STREAM_OK);
+        return;
+    }
+
+    ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
+
+    lb = &ctx->buf_chain;
+    while (rc == NGX_AGAIN) {
+
+        if (c->read->eof) {
+            rc = NGX_STREAM_OK;
+            break;
+        }
+
+        if (!c->read->ready) {
+            if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+                rc = NGX_ERROR;
+            }
+
+            break;
+        }
+
+        buf = ngx_create_temp_buf(c->pool, 1);
+
+        if (buf == NULL) {
+            rc = NGX_ERROR;
+            break;
+        }
+
+        size = buf->end - buf->last;
+
+        n = c->recv(c, buf->last, size);
+
+        if (n == NGX_ERROR) {
+            rc = NGX_STREAM_OK;
+            break;
+        }
+
+        if (n > 0) {
+            buf->last += n;
+
+            buf_chain = ngx_alloc_chain_link(c->pool);
+            if (buf_chain == NULL) {
+                ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            buf_chain->buf = buf;
+            buf_chain->next = NULL;
+
+            if (*lb == NULL) {
+                *lb = buf_chain;
+            } else {
+                (*lb)->next = buf_chain;
+            }
+
+            lb = &(*lb)->next;
+        }
+    }
+
+    ngx_add_timer(ev, 5000);
+
     ngx_stream_echo_write_handler(c->write);
+
+    ctx->buf_chain = NULL;
 }
 
 
@@ -105,25 +192,14 @@ ngx_stream_echo_write_handler(ngx_event_t *ev)
     c = ev->data;
     s = c->data;
 
-    if (ev->timedout) {
-        ngx_connection_error(c, NGX_ETIMEDOUT, "connection timed out");
-        ngx_stream_finalize_session(s, NGX_STREAM_OK);
-        return;
-    }
-
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
 
-    if (ngx_stream_top_filter(s, ctx->out, 1) == NGX_ERROR) {
-        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    if (ctx->buf_chain == NULL) {
         return;
     }
 
-    ctx->out = NULL;
-
-    if (!c->buffered) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                       "stream return done sending");
-        ngx_stream_finalize_session(s, NGX_STREAM_OK);
+    if (ngx_stream_top_filter(s, ctx->buf_chain, 1) == NGX_ERROR) {
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
 
@@ -131,8 +207,6 @@ ngx_stream_echo_write_handler(ngx_event_t *ev)
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
-
-    ngx_add_timer(ev, 5000);
 }
 
 
@@ -149,36 +223,4 @@ ngx_stream_echo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cscf->handler = ngx_stream_echo_handler;
 
     return NGX_CONF_OK;
-}
-
-
-static ngx_int_t
-ngx_stream_echo_preread_handler(ngx_stream_session_t *s)
-{
-    ngx_connection_t *c;
-    c = s->connection;
-    if (c->buffer == NULL) {
-        return NGX_AGAIN;
-    }
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_stream_echo_init(ngx_conf_t *cf)
-{
-    ngx_stream_handler_pt        *h;
-    ngx_stream_core_main_conf_t  *cmcf;
-
-    cmcf = ngx_stream_conf_get_module_main_conf(cf, ngx_stream_core_module);
-
-    h = ngx_array_push(&cmcf->phases[NGX_STREAM_PREREAD_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-
-    *h = ngx_stream_echo_preread_handler;
-
-    return NGX_OK;
 }

@@ -25,5 +25,5 @@ stream {
 
 Start nginx and run the following cmd
 
-	➜  ngx date|nc 127.0.0.1 1080
+	➜  date|nc 127.0.0.1 1080
 	Fri Jan  5 18:46:45 CST 2018
