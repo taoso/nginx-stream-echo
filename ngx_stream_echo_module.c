@@ -10,7 +10,7 @@
 
 
 typedef struct {
-    ngx_chain_t                 *buf_chain;
+    ngx_chain_t                 *out;
 } ngx_stream_echo_ctx_t;
 
 
@@ -72,33 +72,25 @@ ngx_stream_echo_handler(ngx_stream_session_t *s)
 
     c->log->action = "echo";
 
-    ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
-
+    ctx = ngx_pcalloc(c->pool, sizeof(ngx_stream_echo_ctx_t));
     if (ctx == NULL) {
-
-        ctx = ngx_pcalloc(c->pool, sizeof(ngx_stream_echo_ctx_t));
-
-        if (ctx == NULL) {
-            ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-            return;
-        }
-
-        ngx_stream_set_ctx(s, ctx, ngx_stream_echo_module);
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
     }
+
+    ngx_stream_set_ctx(s, ctx, ngx_stream_echo_module);
 
     c->read->handler = ngx_stream_echo_read_handler;
     c->write->handler = ngx_stream_echo_write_handler;
 
     ngx_stream_echo_read_handler(c->read);
-
-    ngx_add_timer(c->read, 5000);
 }
 
 static void
 ngx_stream_echo_read_handler(ngx_event_t *ev)
 {
-    ngx_chain_t           *buf_chain;
-    ngx_chain_t                 **lb;
+    ngx_chain_t                 *out;
+    ngx_chain_t                 **ll;
     ngx_buf_t                   *buf;
     ngx_int_t                     rc;
     ngx_connection_t              *c;
@@ -120,7 +112,7 @@ ngx_stream_echo_read_handler(ngx_event_t *ev)
 
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
 
-    lb = &ctx->buf_chain;
+    ll = &ctx->out;
     while (rc == NGX_AGAIN) {
 
         if (c->read->eof) {
@@ -137,7 +129,6 @@ ngx_stream_echo_read_handler(ngx_event_t *ev)
         }
 
         buf = ngx_create_temp_buf(c->pool, 1);
-
         if (buf == NULL) {
             rc = NGX_ERROR;
             break;
@@ -155,30 +146,35 @@ ngx_stream_echo_read_handler(ngx_event_t *ev)
         if (n > 0) {
             buf->last += n;
 
-            buf_chain = ngx_alloc_chain_link(c->pool);
-            if (buf_chain == NULL) {
+            out = ngx_alloc_chain_link(c->pool);
+            if (out == NULL) {
                 ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
                 return;
             }
 
-            buf_chain->buf = buf;
-            buf_chain->next = NULL;
+            out->buf = buf;
+            out->next = NULL;
 
-            if (*lb == NULL) {
-                *lb = buf_chain;
+            if (*ll == NULL) {
+                *ll = out;
             } else {
-                (*lb)->next = buf_chain;
+                (*ll)->next = out;
             }
 
-            lb = &(*lb)->next;
+            ll = &out->next;
         }
     }
 
+    if (rc != NGX_AGAIN) {
+        ngx_stream_finalize_session(s, rc);
+        return;
+    }
+
+    if (ctx->out) {
+        ngx_stream_echo_write_handler(c->write);
+    }
+
     ngx_add_timer(ev, 5000);
-
-    ngx_stream_echo_write_handler(c->write);
-
-    ctx->buf_chain = NULL;
 }
 
 
@@ -192,21 +188,27 @@ ngx_stream_echo_write_handler(ngx_event_t *ev)
     c = ev->data;
     s = c->data;
 
-    ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
-
-    if (ctx->buf_chain == NULL) {
+    if (ev->timedout) {
+        ngx_connection_error(c, NGX_ETIMEDOUT, "connection timed out");
+        ngx_stream_finalize_session(s, NGX_STREAM_OK);
         return;
     }
 
-    if (ngx_stream_top_filter(s, ctx->buf_chain, 1) == NGX_ERROR) {
+    ctx = ngx_stream_get_module_ctx(s, ngx_stream_echo_module);
+
+    if (ngx_stream_top_filter(s, ctx->out, 1) == NGX_ERROR) {
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
+
+    ctx->out = NULL;
 
     if (ngx_handle_write_event(ev, 0) != NGX_OK) {
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
+
+    ngx_add_timer(ev, 5000);
 }
 
 
